@@ -58,6 +58,14 @@ func NewSecurityOptions(proxyConfig *meshconfig.ProxyConfig, stsPort int, tokenM
 		RootCertFilePath:               security.DefaultRootCertFilePath,
 	}
 
+	// 准备 credIdentity，当前主要提供token，token来源主要有gce和jwt来源，jwt有两处来源（通过jwtPolicy配置）
+	// credIdentity 有参数 CREDENTIAL_FETCHER_TYPE，当前默认jwt；CREDENTIAL_IDENTITY_PROVIDER，默认gce
+	// jwtPolicy配置主要是设置 token来源
+	// third： token来自/var/run/secrets/tokens/istio-token；first： /var/run/secrets/kubernetes.io/serviceaccount/token
+
+	// 这里不用想太复杂，就jwt方式，token从文件读取，ca从caAddr获取即可
+	// 默认是third，且会修改 sa的token 受众为 istio-ca
+
 	o, err := SetupSecurityOptions(proxyConfig, o, jwtPolicy.Get(),
 		credFetcherTypeEnv, credIdentityProvider)
 	if err != nil {

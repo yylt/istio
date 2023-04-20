@@ -41,7 +41,7 @@ export VERSION ?= 1.16-dev
 BASE_VERSION ?= 1.16-2023-03-21T19-02-28
 
 export GO111MODULE ?= on
-export GOPROXY ?= https://proxy.golang.org
+export GOPROXY ?= https://goproxy.cn
 export GOSUMDB ?= sum.golang.org
 
 # If GOPATH is not set by the env, set it to a sane value

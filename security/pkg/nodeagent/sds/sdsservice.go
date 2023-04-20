@@ -95,6 +95,7 @@ func NewXdsServer(stop chan struct{}, gen model.XdsResourceGenerator) *xds.Disco
 }
 
 // newSDSService creates Secret Discovery Service which implements envoy SDS API.
+// 生成 证书文件并写入到文件中缓存
 func newSDSService(st security.SecretManager, options *security.Options, pkpConf *mesh.PrivateKeyProvider) *sdsservice {
 	ret := &sdsservice{
 		st:      st,
@@ -103,6 +104,7 @@ func newSDSService(st security.SecretManager, options *security.Options, pkpConf
 	}
 	ret.XdsServer = NewXdsServer(ret.stop, ret)
 
+	// 根据platform不同，地址不同
 	ret.rootCaPath = options.CARootPath
 
 	if options.FileMountedCerts {

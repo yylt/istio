@@ -183,7 +183,15 @@ func NewDiscoveryServer(env *model.Environment, instanceID string, clusterAliase
 	for alias := range clusterAliases {
 		out.ClusterAliases[cluster.ID(alias)] = cluster.ID(clusterAliases[alias])
 	}
-
+	/*
+		系统默认的路径有如下，同时会搜索文件 /cacerts/extra.pem
+		"/etc/ssl/certs/ca-certificates.crt",                // Debian/Ubuntu/Gentoo etc.
+		"/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora/RHEL 6
+		"/etc/ssl/ca-bundle.pem",                            // OpenSUSE
+		"/etc/pki/tls/cacert.pem",                           // OpenELEC
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS/RHEL 7
+		"/etc/ssl/cert.pem",                                 // Alpine
+	*/
 	out.initJwksResolver()
 
 	if features.EnableXDSCaching {

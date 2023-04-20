@@ -177,6 +177,9 @@ type Server struct {
 
 // NewServer creates a new Server instance based on the provided arguments.
 func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
+	// 准备 env， 主要功能
+	// 1 添加回调函数，当 meshconfig 和networkconfig 更新
+	// 2 准备 xds pushContext
 	e := model.NewEnvironment()
 	e.DomainSuffix = args.RegistryOptions.KubeOptions.DomainSuffix
 	e.SetLedger(buildLedger(args.RegistryOptions))
@@ -220,6 +223,11 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	}
 	// Initialize workload Trust Bundle before XDS Server
 	e.TrustBundle = s.workloadTrustBundle
+
+	// 初始化XDSServer，内部有多层 channel
+	// 有关可以参考以下文字
+	// https://www.zhaohuabing.com/post/2019-10-21-pilot-discovery-code-analysis/
+	// https://cloudnative.to/blog/istio-pilot-3/
 	s.XDSServer = xds.NewDiscoveryServer(e, args.PodName, args.RegistryOptions.KubeOptions.ClusterAliases)
 
 	prometheus.EnableHandlingTimeHistogram()
@@ -228,7 +236,14 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	s.addReadinessProbe("discovery", func() (bool, error) {
 		return s.XDSServer.IsServerReady(), nil
 	})
+	// 准备 http和grpc服务
+	// 初始化 s.grpcServer 和 httpServer 和 monitorAddr
+	// httpServer 处理函数是 s.httpMux, 若grpc和monitor为空，则也集合到httpMux中，
+
 	s.initServers(args)
+
+	// httpMux 提供 profile，/ready 接口
+	// monitorMux 处理 /metrics
 	if err := s.initIstiodAdminServer(args, whc); err != nil {
 		return nil, fmt.Errorf("error initializing debug server: %v", err)
 	}
@@ -242,14 +257,29 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	}
 
 	// used for both initKubeRegistry and initClusterRegistries
+	// k8s > 1.21 使用epslice，或者环境变量 PILOT_USE_ENDPOINT_SLICE=tre
 	args.RegistryOptions.KubeOptions.EndpointMode = kubecontroller.DetectEndpointMode(s.kubeClient)
-
+	// 初始化meshconfig, 设置env下的 Watcher 和 NetworksWatcher
+	// 当前来源主要有 configmap 和 file
+	// 若环境变量 REVISION 定义且不是default，则 configmap 的名称会是istio-$Revision
+	// 若环境变量 SHARED_MESH_CONFIG 定义，则从另一个 configmap 中读取并合并到之前配置内
 	s.initMeshConfiguration(args, s.fileWatcher)
 	spiffe.SetTrustDomain(s.environment.Mesh().GetTrustDomain())
 
+	// 主要初始化 env下的 NetworksWatcher，如上一步中已经
+	// 初始化，则这步什么都不做
 	s.initMeshNetworks(args, s.fileWatcher)
+
+	// 添加 meshconfig 更新后的操作
+	// 执行 XDSServer.ConfigUpdate()：通知 istio-agent 更新 meshconfig
 	s.initMeshHandlers()
+	// 初始化 node 发现的provider，以及env中的domainSuffix
 	s.environment.Init()
+
+	// 初始化env的NetworkManager
+	// 网络管理器会注册 network 变更回调函数
+	// reloadGateways：触发networks上下文 全拉取
+	// reloadNetworkEndpoints：当feature EnableHCMInternalNetworks为true时，也是在networks上下文，触发全拉取
 	if err := s.environment.InitNetworksManager(s.XDSServer); err != nil {
 		return nil, err
 	}
@@ -267,33 +297,62 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		caOpts.ExternalCASigner = k8sSigner
 	}
 	// CA signing certificate must be created first if needed.
+	// 当 feature EnableCAServer 打开时，如果自建caServer,可以参考 cert-manager/istio-csr
+	// 1 准备ca，从目录中，或者使用k8s准备的secret
+	// 2 若不是k8s环境，则自己准备ca相关证书和私钥
+	// 初始化 s.RA, s.CA
 	if err := s.maybeCreateCA(caOpts); err != nil {
 		return nil, err
 	}
 
+	// meshConfig 和 networkConfig 更新处理函数xDS回调准备完毕，现在开始准备控制器
+	// 主要针对资源 cluster，workload和service
+	// 当前cert也有，但更推荐用 cert-manager
+	// controller 更多是 operator形式，所以都有 RUN() 方法
 	if err := s.initControllers(args); err != nil {
 		return nil, err
 	}
 
+	// 设置 s.Generators ,关联 xDS 请求对应的资源类型
 	s.XDSServer.InitGenerators(e, args.Namespace, s.internalDebugMux)
 
 	// Initialize workloadTrustBundle after CA has been initialized
+	// 当打开 MULTICA 特性，才初始化 workload 信任包
+	// 信任包来自 meshconfig 的ca参数
+	// ca 配置中有两个方式，一种是配置pem内容，另一种是spiffe url地址
+	// 当meshconfig 中 ca配置更新后，会由xdsServer通知更新agent GlobalUpdate
 	if err := s.initWorkloadTrustBundle(args); err != nil {
 		return nil, err
 	}
 
 	// Parse and validate Istiod Address.
+	// 获取 istiod 的域名/ip 地址
 	istiodHost, _, err := e.GetDiscoveryAddress()
 	if err != nil {
 		return nil, err
 	}
 
 	// Create Istiod certs and setup watches.
+	// 设置 istiod 证书，用于 k8s-webhook 和 grpc 服务上的 tls 认证
+	//
+	// 证书来源优先自定义配置，自定义配置来源有选项，之后默认路径，如下
+	// ./var/run/secrets/istiod/tls/{tls.crt,tls.key,ca.crt} 或 ./var/run/secrets/istiod/ca/root-cert.pem
+	// ca/root-cert.pem 优先级高于 tls/ca.crt
+	// 当自定义(上述文件)不存在时，支持通过如下方式配置
+	// 当 PILOT_CERT_PROVIDER 为 istiod, 实际上这是默认值，需要enableCAServer
+	// 当 PILOT_CERT_PROVIDER 为 kubernetes 是，从下文件读取ca
+	// 		/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+	// 当 PILOT_CERT_PROVIDER 为 k8s.io/ 前缀时，从 s.RA 中获取，这里也需要是 enableCAServer
+	// 当 PILOT_CERT_PROVIDER 为 none 时，会从文件 /etc/certs/root-cert.pem 中读取 cacert 信息
+	// 除none外，都会有 csr 和 keypem 文件生成，并watch变化，随时更新
+	// 如要自定义ca和证书，key等，要自定义配置合适；如不enableCAServer，那只能选择kubernetes方式
 	if err := s.initIstiodCerts(args, string(istiodHost)); err != nil {
 		return nil, err
 	}
 
 	// Secure gRPC Server must be initialized after CA is created as may use a Citadel generated cert.
+	// 初始化 grpc xDS server服务
+	// 主要处理内容 添加证书校验(通过 spiffe，可以是本地证书，可以是remote)，指标插入，添加启动函数
 	if err := s.initSecureDiscoveryService(args); err != nil {
 		return nil, fmt.Errorf("error initializing secure gRPC Listener: %v", err)
 	}
@@ -307,24 +366,38 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error initializing sidecar injector: %v", err)
 		}
+		// 初始化 webhook 控制器，用于监听 configmap 资源，当前是来自 VALIDATION_WEBHOOK_CONFIG_NAME（默认istio-istio-system）
+		// 逻辑：
+		// 1 更新 valid webhook 中ca字段，若这里使用 cert-manager,可以设置空
+		// 2 由 cert-manager 配置注解 cert-manager.io/inject-ca-from
 		if err := s.initConfigValidation(args); err != nil {
 			return nil, fmt.Errorf("error initializing config validator: %v", err)
 		}
 	}
 
 	// This should be called only after controllers are initialized.
+	// 注册资源更新回调函数，当前是通知 xds 客户端更新
+	// 资源中，不包含 serviceEntry，worklaod*
+	// 其他资源默认是 configUpdate 处理函数
 	s.initRegistryEventHandlers()
 
+	// 添加启动函数，启动 xdsServer
 	s.initDiscoveryService()
 
+	// 当打开 PILOT_ENABLE_XDS_IDENTITY_CHECK 时，会执行初始化，具体有
+	// 1 添加secret （multiCluster）回调函数
 	s.initSDSServer()
 
 	// Notice that the order of authenticators matters, since at runtime
 	// authenticators are activated sequentially and the first successful attempt
 	// is used as the authentication result.
+
+	// 认证有关配置，当前一定支持 cert认证
 	authenticators := []security.Authenticator{
 		&authenticate.ClientCertAuthenticator{},
 	}
+	// jwtrule 参数目前没有看到传入方式，倒是
+	// RequestAuthentication.security.istio.io/v1beta1 资源可以设置 jwtrule
 	if args.JwtRule != "" {
 		jwtAuthn, err := initOIDC(args, s.environment.Mesh().TrustDomain)
 		if err != nil {
@@ -337,6 +410,8 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	}
 	// The k8s JWT authenticator requires the multicluster registry to be initialized,
 	// so we build it later.
+	// 1 需要先打开多集群，并且有设置 jwt_policy 为 third
+	// 解析 jwt 并获取 audit列表，再交给apiserver校验
 	if s.kubeClient != nil {
 		authenticators = append(authenticators,
 			kubeauth.NewKubeJWTAuthenticator(s.environment.Watcher, s.kubeClient.Kube(), s.clusterID, s.multiclusterController.GetRemoteKubeClient, features.JwtPolicy))
@@ -385,6 +460,8 @@ func initOIDC(args *PilotArgs, trustDomain string) (security.Authenticator, erro
 	return jwtAuthn, nil
 }
 
+// 若启动选项clusterID为空，则
+// 若有 Kubernetes 注册器，使用Kubernetes，否则返回配置的 clusterID
 func getClusterID(args *PilotArgs) cluster.ID {
 	clusterID := args.RegistryOptions.KubeOptions.ClusterID
 	if clusterID == "" {
@@ -733,7 +810,8 @@ func (s *Server) initSecureDiscoveryService(args *PilotArgs) error {
 		log.Info("The secure discovery port is disabled, multiplexing on httpAddr ")
 		return nil
 	}
-
+	// 当有配置tls信息，那么就使用本地方式校验
+	// 若有配置 SPIFFE_BUNDLE_ENDPOINTS feature，新增remote spiffe 校验
 	peerCertVerifier, err := s.createPeerCertVerifier(args.ServerOptions.TLSOptions)
 	if err != nil {
 		return err
@@ -1116,19 +1194,37 @@ func (s *Server) getIstiodCertificate(*tls.ClientHelloInfo) (*tls.Certificate, e
 // initControllers initializes the controllers.
 func (s *Server) initControllers(args *PilotArgs) error {
 	log.Info("initializing controllers")
+
+	// 监听secret，命名空间是来自 选择配置的 DiscoverySelector
+	// 使用label： istio/multiCluster="true"
+	// secret DATA内容格式是 clusterID： kubeconfig
+	// 当前得到 cluster 后，具体的回调 handler 由后面添加处理
 	s.initMulticluster(args)
+
 	// Certificate controller is created before MCP controller in case MCP server pod
 	// waits to mount a certificate to be provisioned by the certificate controller.
+	// 证书管理推荐使用 cert-manager ，不建议在这里配置
 	if err := s.initCertController(args); err != nil {
 		return fmt.Errorf("error initializing certificate controller: %v", err)
 	}
 	if features.EnableEnhancedResourceScoping.Load() {
 		// setup namespace filter
+		// 需要开启多集群后，才会从 meshconfig.discoverySelector 设置mcctrl的过滤器
+		// 这里又对 本集群设置过滤，但需要开启环境变量。。
 		args.RegistryOptions.KubeOptions.DiscoveryNamespacesFilter = s.multiclusterController.DiscoveryNamespacesFilter
 	}
+
+	// configController 主要是准备 configStores
+	// 当前有文件，k8s和xds来源，其中 k8s 来源是有以下
+	// 1 istio crd；2 gateway ；3 ingress
+	// aggregateConfigController 是来自多个 configStore 信息，对外提供 CRUD和
+	// s.configController 实际内容也是 aggregateConfigController，
+	// xds和k8s统一的方式是 注册gvk的回调函数方式，xds的resource也是gvk格式
 	if err := s.initConfigController(args); err != nil {
 		return fmt.Errorf("error initializing config controller: %v", err)
 	}
+	// 初始化 s.serviceEntryController，命名空间是配置的 DiscoverySelector
+	// 也会注册 multiCluster 的处理函数，原因是会处理remote上的 se(serviceEntry) 和 workloadEntry资源
 	if err := s.initServiceControllers(args); err != nil {
 		return fmt.Errorf("error initializing service controllers: %v", err)
 	}

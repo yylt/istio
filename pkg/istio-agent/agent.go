@@ -214,11 +214,12 @@ func (a *Agent) WaitForSigterm() bool {
 
 func (a *Agent) generateNodeMetadata() (*model.Node, error) {
 	var pilotSAN []string
+	// 默认是mtls，但应该只是 agent->istiod, 这里是获取disAddr的域名是？
 	if a.proxyConfig.ControlPlaneAuthPolicy == mesh.AuthenticationPolicy_MUTUAL_TLS {
 		// Obtain Pilot SAN, using DNS.
 		pilotSAN = []string{config.GetPilotSan(a.proxyConfig.DiscoveryAddress)}
 	}
-
+	// 检查路径 /var/run/secrets/credential-uds/socket
 	credentialSocketExists, err := checkSocket(context.TODO(), security.CredentialNameSocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check credential SDS socket: %v", err)
@@ -240,7 +241,8 @@ func (a *Agent) generateNodeMetadata() (*model.Node, error) {
 		EnvoyPrometheusPort:         a.cfg.EnvoyPrometheusPort,
 		EnvoyStatusPort:             a.cfg.EnvoyStatusPort,
 		ExitOnZeroActiveConnections: a.cfg.ExitOnZeroActiveConnections,
-		XDSRootCert:                 a.cfg.XDSRootCerts,
+		// 是agent->istiod ，怎么这里也在使用
+		XDSRootCert: a.cfg.XDSRootCerts,
 	})
 }
 
@@ -328,10 +330,11 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 // Run is a non-blocking call which returns either an error or a function to await for completion.
 func (a *Agent) Run(ctx context.Context) (func(), error) {
 	var err error
+	// 当sidecar模式，且enable时会有 dnsServer
 	if err = a.initLocalDNSServer(); err != nil {
 		return nil, fmt.Errorf("failed to start local DNS server: %v", err)
 	}
-
+	// secret DS 的uds位置: /var/run/secrets/workload-spiffe-uds/socket
 	socketExists, err := checkSocket(ctx, security.WorkloadIdentitySocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check SDS socket: %v", err)
@@ -341,11 +344,15 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 		log.Info("Workload SDS socket found. Istio SDS Server won't be started")
 	} else {
 		log.Info("Workload SDS socket not found. Starting Istio SDS Server")
+		// 初始化sds服务，该服务监听的UDS见上文
+		// sds 服务对接的是外部 caServer，当前若未设置，则为istid地址
 		err = a.initSdsServer()
 		if err != nil {
 			return nil, fmt.Errorf("failed to start SDS server: %v", err)
 		}
 	}
+	// 初始化 xdsUDSPath，并在该路径上使用 discoveryServer 监听 (也就是proxy)
+	// 准备到istiod的拨号选项
 	a.xdsProxy, err = initXdsProxy(a)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start xds proxy: %v", err)
@@ -362,6 +369,10 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 			return nil, fmt.Errorf("failed generating gRPC XDS bootstrap: %v", err)
 		}
 	}
+	// meshconfig.defaultConfig.controlPlaneAuthPolicy 默认 mtls
+	// caforxds 是 agent -> istiod 准备的，在istiod中 webhook和grpc用的
+	// 是相同的 ca 证书，不同在于grpc使用默认的路径位置，webhook是 cr上定义
+	// caForXds 也有多种来源，另外都会监听文件变化
 	if a.proxyConfig.ControlPlaneAuthPolicy != mesh.AuthenticationPolicy_NONE {
 		rootCAForXDS, err := a.FindRootCAForXDS()
 		if err != nil {
@@ -397,6 +408,11 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 	return a.wg.Wait, nil
 }
 
+// 证书来源也是多个地方，首先是静态文件
+// 静态文件 /var/run/secrets/workload-spiffe-credentials/{root-cert.pem,cert-chain.pem,key.pem}
+// 非静态文件时，则需ca和ca签名
+// 1 pilot-cert-provider 会验证是否为kubernetes，coustom，none，istiod(通常是默认)
+// 2 当为istiod时，会寻找从configmap挂载的文件
 func (a *Agent) initSdsServer() error {
 	var err error
 	if security.CheckWorkloadCertificate(security.WorkloadIdentityCertChainPath, security.WorkloadIdentityKeyPath, security.WorkloadIdentityRootCertPath) {
@@ -514,7 +530,8 @@ func (a *Agent) generateGRPCBootstrap() error {
 	if err := os.MkdirAll(filepath.Dir(a.cfg.GRPCBootstrapPath), 0o700); err != nil {
 		return err
 	}
-
+	// envoy -> agent使用的是 /etc/istio/proxy/XDS （XdsUdsPath）
+	// GRPCBootstrapPath是envoy启动时的配置文件：/etc/istio/proxy/grpc-bootstrap.json
 	_, err = grpcxds.GenerateBootstrapFile(grpcxds.GenerateBootstrapOptions{
 		Node:             node,
 		XdsUdsPath:       a.cfg.XdsUdsPath,
@@ -587,6 +604,13 @@ func (a *Agent) close() {
 // It may be different from the CA for the cert server - which is based on CA_ADDR
 // In addition it deals with the case the XDS server is on port 443, expected with a proper cert.
 // /etc/ssl/certs/ca-certificates.crt
+// 有多个参数影响caForXds，环境变量
+// 环境变量 XDS_ROOT_CA 为 SYSTEM 或其他路径
+// 默认路径 /etc/certs/root-cert.pem
+// pilot-cert：默认是istiod，这里会判断是否为kubernets，none
+// 另一个默认路径  /var/run/secrets/istio/root-cert.pem
+// 上路径是从 configmap istio-ca-root-cert.root-cert.pem 挂载
+// 一般情况下会使用到最后这个
 func (a *Agent) FindRootCAForXDS() (string, error) {
 	var rootCAPath string
 
@@ -758,6 +782,7 @@ func getKeyCertInner(certPath string) (string, string) {
 }
 
 // newSecretManager creates the SecretManager for workload secrets
+// 准备ca后，创建 secretManager
 func (a *Agent) newSecretManager() (*cache.SecretManagerClient, error) {
 	// If proxy is using file mounted certs, we do not have to connect to CA.
 	if a.secOpts.FileMountedCerts {
@@ -791,6 +816,8 @@ func (a *Agent) newSecretManager() (*cache.SecretManagerClient, error) {
 	var err error
 	// Special case: if Istiod runs on a secure network, on the default port, don't use TLS
 	// TODO: may add extra cases or explicit settings - but this is a rare use cases, mostly debugging
+	// 15010端口 是istiod 非安全端口
+	// 一般情况下，会从 caForCa 找到ca证书
 	if strings.HasSuffix(a.secOpts.CAEndpoint, ":15010") {
 		log.Warn("Debug mode or IP-secure network")
 	} else {

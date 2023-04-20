@@ -105,11 +105,13 @@ func newProxyCommand() *cobra.Command {
 			log.Infof("Version %s", version.Info.String())
 
 			logLimits()
-
+			// 获取ip信息，确定id和namespace
 			proxy, err := initProxy(args)
 			if err != nil {
 				return err
 			}
+			// 一般sidecar是由istiod注入得到，很多是通过环境变量注入，因为configmap挂载是命名空间级别，不方便
+			// 准备proxyconfig
 			proxyConfig, err := config.ConstructProxyConfig(proxyArgs.MeshConfigFile, proxyArgs.ServiceCluster, options.ProxyConfigEnv, proxyArgs.Concurrency, proxy)
 			if err != nil {
 				return fmt.Errorf("failed to get proxy config: %v", err)
@@ -129,6 +131,9 @@ func newProxyCommand() *cobra.Command {
 			// listen on STS port for STS requests. For STS, see
 			// https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16.
 			// STS is used for stackdriver or other Envoy services using google gRPC.
+			// 安全token服务 目前在私有化场景比较少，默认values.sts.servicePort也为0
+			//
+
 			if proxyArgs.StsPort > 0 {
 				stsServer, err := initStsServer(proxy, secOpts.TokenManager)
 				if err != nil {

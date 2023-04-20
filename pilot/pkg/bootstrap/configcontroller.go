@@ -55,6 +55,7 @@ const (
 )
 
 // initConfigController creates the config controller in the pilotConfig.
+// 每个 ConfigStore 主要方法有 Run/HasSynced/CRUD/Schema
 func (s *Server) initConfigController(args *PilotArgs) error {
 	s.initStatusController(args, features.EnableStatus && features.EnableDistributionTracking)
 	meshConfig := s.environment.Mesh()
@@ -74,6 +75,9 @@ func (s *Server) initConfigController(args *PilotArgs) error {
 		}
 		s.ConfigStores = append(s.ConfigStores, configController)
 	} else {
+		// k8s的配置来源内还有检查 workload 健康的 operator，这里合适么？
+		// 初始化 s.XDSServer.WorkloadEntryController 和  s.RWConfigStore
+		// 意思是 workloadEntry 只能适用于k8s环境
 		err := s.initK8SConfigStore(args)
 		if err != nil {
 			return err

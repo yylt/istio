@@ -74,6 +74,8 @@ func NewNetworkManager(env *Environment, xdsUpdater XDSUpdater) (*NetworkManager
 	}
 	mgr := &NetworkManager{env: env, NameCache: nameCache, xdsUpdater: xdsUpdater}
 	env.AddNetworksHandler(mgr.reloadGateways)
+	// HCM 是 http connection manager。该feature默认false
+	// 是不是把 endpoints 也记录到 envoy 配置文件中
 	if features.EnableHCMInternalNetworks {
 		env.AddNetworksHandler(mgr.reloadNetworkEndpoints)
 	}
